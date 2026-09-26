@@ -1,0 +1,159 @@
+#include <Crypto.h>
+#include <AES.h>
+#include <AES_CMAC.h>
+
+
+
+void printUint64(uint64_t value)
+{
+    char buf[21];
+    buf[20] = '\0';
+
+    if (value == 0)
+    {
+        Serial.println("0");
+        return;
+    }
+
+    int8_t i = 19;
+    while (value > 0)
+    {
+        buf[i--] = '0' + (value % 10);
+        value /= 10;
+    }
+
+    Serial.println(&buf[i + 1]);
+}
+
+
+void setup()
+{
+    Serial.begin(9600);
+
+    // Token received from keypad
+
+    // Meter ID, 4 bits, max value 15 (only 4 bits allowed here)
+    // serial,  16 bit max value 6535
+    // recharge, units ie kWh, 10 bits, max value 1023
+
+    //Meter ID: 4, Serial: 12345,Recharge: 500
+    //uint64_t token = 4828870145199298234ULL;
+
+    //Meter ID: 15, Serial: 65535, Recharge: 1023,
+    uint64_t token = 17408805082419069468ULL;
+                     
+    // ==========================================
+    // 1. Extract 32-bit MESSAGE
+    // ==========================================
+
+    uint32_t message =
+        (uint32_t)(token >> 32);
+
+
+    // ==========================================
+    // 2. Extract received 32-bit MAC
+    // ==========================================
+
+    uint32_t receivedMAC =
+        (uint32_t)(token & 0xFFFFFFFFULL);
+
+
+    // ==========================================
+    // 3. Convert MESSAGE to 4 bytes
+    // ==========================================
+
+    uint8_t data_raw[4];
+    data_raw[0] = (uint8_t)(message >> 24);
+    data_raw[1] = (uint8_t)(message >> 16);
+    data_raw[2] = (uint8_t)(message >> 8);
+    data_raw[3] = (uint8_t)message;
+
+
+    // ==========================================
+    // 4. Generate CMAC
+    // ==========================================
+
+    uint8_t mac[16];
+
+    AESTiny128 aes128;
+    AES_CMAC cmac(aes128);
+
+    cmac.generateMAC(
+        mac,
+        key,
+        data_raw,
+        sizeof(data_raw)
+    );
+
+
+    // ==========================================
+    // 5. Take first 4 bytes of CMAC
+    // ==========================================
+
+    uint32_t calculatedMAC =
+        ((uint32_t)mac[0] << 24) |
+        ((uint32_t)mac[1] << 16) |
+        ((uint32_t)mac[2] << 8)  |
+        mac[3];
+
+
+    // ==========================================
+    // 6. Display
+    // ==========================================
+
+    Serial.print("TOKEN: ");
+    printUint64(token);
+
+    Serial.print("MESSAGE: 0x");
+    Serial.println(message, HEX);
+
+    Serial.print("Received MAC: 0x");
+    Serial.println(receivedMAC, HEX);
+
+    Serial.print("Calculated MAC: 0x");
+    Serial.println(calculatedMAC, HEX);
+
+
+    // ==========================================
+    // 7. Authenticate
+    // ==========================================
+
+    if (receivedMAC == calculatedMAC)
+    {
+        Serial.println("AUTHENTICATION SUCCESS");
+        // Now it is safe to decode the message
+            // ==========================================
+    // 8. Extract fields
+    // ==========================================
+
+    uint8_t meterID =
+        (message >> 28) & 0x0F;
+
+    uint16_t serial =
+        (message >> 12) & 0xFFFF;
+
+    uint16_t recharge =
+        (message >> 2) & 0x03FF;
+
+
+    Serial.print("Meter ID: ");
+    Serial.println(meterID);
+
+    Serial.print("Serial: ");
+    Serial.println(serial);
+
+    Serial.print("Recharge: ");
+    Serial.println(recharge);
+    }
+    else
+    {
+        Serial.println("AUTHENTICATION FAILED");
+
+        // DO NOT use the decoded recharge value
+    }
+}
+
+
+void loop()
+{
+}

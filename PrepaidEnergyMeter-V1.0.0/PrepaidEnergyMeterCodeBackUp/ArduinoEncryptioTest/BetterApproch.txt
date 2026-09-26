@@ -1,0 +1,37 @@
+TOKEN GENERATION:-
+
+ plaintext(message/token) + authentication (generate the authitincation tag) = total 16 bytes only
+                      │	(CMAC generates 16 bytes auth tag, use the first 8 bytes or as per needs)
+
+                   AES-128 (encrypted to 16 bytes cypertext)
+                      │
+                 ciphertext (converter to hexadecimal string, 32 entries)
+                      
+//-----------------------------------------------------------------------------------------
+
+On Atmega8 Mcu:-
+
+                 User enters (user enters this 32 entries via keyboard)
+                      │
+                  ATmega8
+                      │
+                 AES decrypt
+                      │
+     Verify authentication (calculate /generate auth tag, compare with the received auth tag)
+                 /            \
+              FAIL            PASS
+               │                │
+            REJECT        Check Meter ID
+                              │
+                         Check Serial
+                              │
+                         Apply recharge
+
+//------------------------------------------------------------------------
+Byte 0       Meter ID       1 byte
+Byte 1-4     Serial         4 bytes
+Byte 5-6     Recharge       2 bytes
+Byte 7-14    Auth tag       8 bytes
+Byte 15      --Emty--        1 byte
+────────────────────────────────
+             Total          16 bytes

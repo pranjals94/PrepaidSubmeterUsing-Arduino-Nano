@@ -1,0 +1,116 @@
+#include <Crypto.h>
+#include <AES.h>
+#include <AES_CMAC.h>
+
+
+
+const uint8_t key[16] = {
+  0x2b, 0x7e, 0x15, 0x16,
+  0x28, 0xae, 0xd2, 0xa6,
+  0xab, 0xf7, 0x15, 0x88,
+  0x09, 0xcf, 0x4f, 0x3c,
+};
+
+void printUint64(uint64_t value)
+{
+    if (value == 0)
+    {
+        Serial.println("0");
+        return;
+    }
+
+    char buf[21];
+    buf[20] = '\0';
+
+    int8_t i = 19;
+
+    while (value > 0)
+    {
+        buf[i--] = '0' + (value % 10);
+        value /= 10;
+    }
+
+    Serial.println(&buf[i + 1]);
+}
+
+//-----------------------------------------------------------------------------
+uint32_t makeMessage(uint8_t meterID,
+                     uint16_t serial,
+                     uint16_t recharge)
+{
+    uint32_t message = 0;
+
+    // Meter ID: bits 31-28
+    message |= ((uint32_t)(meterID & 0x0F) << 28);
+
+    // Serial: bits 27-12
+    message |= ((uint32_t)serial << 12);
+
+    // Recharge: bits 11-2
+    message |= ((uint32_t)(recharge & 0x03FF) << 2);
+
+    // Bits 1-0 reserved/emty = 00
+
+    return message;
+}
+
+
+void extractFields(uint32_t token,
+                   uint8_t *meterID,
+                   uint16_t *serial,
+                   uint16_t *recharge)
+{
+    // Extract Meter ID: bits 31-28
+    *meterID = (token >> 28) & 0x0F;
+
+    // Extract Serial: bits 27-12
+    *serial = (token >> 12) & 0xFFFF;
+
+    // Extract Recharge: bits 11-2
+    *recharge = (token >> 2) & 0x03FF;
+}
+
+
+void setup()
+{
+    Serial.begin(9600);
+
+    // Example values
+    uint8_t  meterID  = 15;// 4 bits, max value 15 (only 4 bits allowed here)
+    uint16_t serial   = 6535; // 16 bit max value 6535
+    uint16_t recharge = 1023; //units ie kWh, 10 bits, max value 1023
+
+    // to store cmac Output
+    uint8_t mac[16];
+
+    AESTiny128 aes128;
+    AES_CMAC cmac(aes128);
+
+    uint32_t message = makeMessage(meterID, serial, recharge);
+    //store the 32-bit message to 4 bytes arrey
+    const uint8_t data_raw[4] = {
+                    (uint8_t)(message >> 24),
+                    (uint8_t)(message >> 16),
+                    (uint8_t)(message >> 8),
+                    (uint8_t)message
+                  };
+    
+    // Generate the MAC from data_raw, using the key. The result is stored into mac
+    cmac.generateMAC(mac, key, data_raw, sizeof(data_raw));
+    uint32_t mac32 =
+      ((uint32_t)mac[0] << 24) |
+      ((uint32_t)mac[1] << 16) |
+      ((uint32_t)mac[2] << 8)  |
+      mac[3];
+
+uint64_t token =
+    ((uint64_t)message << 32) | mac32;
+
+    Serial.println("64-bit TOKEN");
+    printUint64(token);
+}
+
+
+void loop()
+{
+}

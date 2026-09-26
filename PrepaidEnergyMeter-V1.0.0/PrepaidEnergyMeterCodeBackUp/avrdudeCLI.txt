@@ -1,0 +1,11 @@
+program the flash memory only in the atmega8l chip,
+but this command will alo perform erase that will erase both
+the flash and eeprom memory, to prevent eeprom erase, set the
+H fuses to 0xC1 on the chip.
+
+./avrdude -c usbasp -p m8 -U flash:w:PrepaidEnergyMeter.hex
+
+
+program the eeprom only
+
+./avrdude -c usbasp -p m8 -U eeprom:w:"test.eep":i

@@ -1,0 +1,38 @@
+TOKEN GENERATION:- 20 digits number
+
+ msg/token 32 bits + authentication 32 bits (generate the authitincation tag) = total 64 bits
+                     (CMAC generates 16 bytes auth tag, use the first 4 bytes or as per needs)
+
+		Meter id : 4 bits
+	 Token Serial no : 16 bits
+	  Recharge Units : 10 bits		(Cant use Aes encryption as it generates 
+	       free bits :  2 bits		 16 byte cypertext)
+	___________________________________
+		total 32 bits message/token
+
+ Authentication Tag (MAC): 32 bits
+
+	total 64 bits = a uint64_t integer (Maximum = Token:18446-7440
+						      7-37095-51615---)
+	so the user can input this 20 digit number via keypad.
+                      
+//-----------------------------------------------------------------------------------------
+
+On Atmega8 Mcu:-
+
+                 User enters (user enters this 20 digit token via keyboard)
+                      │
+                  ATmega8
+                      │
+                 extracts information from this 20 digit (uint64) number
+     generates/calculates the authentication (mac)tag and compare with the received auth tag)
+                 /            \
+              FAIL            PASS
+               │                │
+            REJECT        Check Meter ID
+                              │
+                         Check Serial
+                              │
+                         Apply recharge
+
+//------------------------------------------------------------------------

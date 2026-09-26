@@ -1,0 +1,347 @@
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include <Keypad.h>
+#include <stdint.h>
+
+// ==================================================
+// LCD
+// ==================================================
+
+LiquidCrystal lcd(A0, A1, 4, 5, 6, 7);
+
+
+// ==================================================
+// KEYPAD
+// ==================================================
+
+const byte ROWS = 4;
+const byte COLS = 3;
+
+char keys[ROWS][COLS] =
+{
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'*', '0', '#'}
+};
+
+byte rowPins[ROWS] = {8, 9, 10, 11};
+byte colPins[COLS] = {12, A2, A3};
+
+Keypad keypad = Keypad(
+    makeKeymap(keys),
+    rowPins,
+    colPins,
+    ROWS,
+    COLS
+);
+
+
+// ==================================================
+// DISPLAY TOKEN
+// ==================================================
+
+void DisplayToken(const char *tokenBuffer, uint8_t tokenIndex)
+{
+    lcd.clear();
+
+    // -------------------------------
+    // First line
+    // -------------------------------
+
+    lcd.setCursor(0, 0);
+    lcd.print("Token: ");
+
+    // First group: 0000
+    for (uint8_t i = 0; i < 4; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 4)
+        lcd.print('-');
+
+    // Second group: 0000
+    for (uint8_t i = 4; i < 8; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    // -------------------------------
+    // Second line
+    // -------------------------------
+
+    lcd.setCursor(0, 1);
+
+    if (tokenIndex >= 8)
+        lcd.print('-');
+
+    // Third group
+    for (uint8_t i = 8; i < 12; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 12)
+        lcd.print('-');
+
+    // Fourth group
+    for (uint8_t i = 12; i < 16; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 16)
+        lcd.print('-');
+
+    // Fifth group
+    for (uint8_t i = 16; i < 20; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+}
+
+
+// ==================================================
+// CHECK AND CONVERT 20 DIGIT STRING TO uint64_t
+// ==================================================
+//
+// Returns:
+// 1 = success
+// 0 = overflow / invalid
+//
+// The result is returned through *result.
+//
+// ==================================================
+
+uint8_t StringToUint64(const char *str, uint64_t *result)
+{
+    uint64_t value = 0;
+
+    while (*str)
+    {
+        // Check that character is a digit
+        if (*str < '0' || *str > '9')
+            return 0;
+
+        uint8_t digit = *str - '0';
+
+        // ------------------------------------------
+        // Overflow check
+        // ------------------------------------------
+        //
+        // Before:
+        //
+        // value = value * 10 + digit
+        //
+        // Check whether this operation would exceed
+        // UINT64_MAX.
+        //
+        // ------------------------------------------
+
+        if (value > (UINT64_MAX - digit) / 10ULL)
+        {
+            return 0;
+        }
+
+        value = value * 10ULL + digit;
+
+        str++;
+    }
+
+    *result = value;
+
+    return 1;
+}
+
+
+// ==================================================
+// GET TOKEN FROM KEYPAD
+// ==================================================
+
+uint64_t GetToken(void)
+{
+    char tokenBuffer[21];
+
+    uint8_t tokenIndex = 0;
+
+    tokenBuffer[0] = '\0';
+
+    while (1)
+    {
+        char key = keypad.getKey();
+
+        if (key == NO_KEY)
+            continue;
+
+
+        // ==========================================
+        // NUMBER KEY
+        // ==========================================
+
+        if (key >= '0' && key <= '9')
+        {
+            if (tokenIndex < 20)
+            {
+                tokenBuffer[tokenIndex] = key;
+
+                tokenIndex++;
+
+                tokenBuffer[tokenIndex] = '\0';
+
+                DisplayToken(tokenBuffer, tokenIndex);
+            }
+        }
+
+
+        // ==========================================
+        // * = BACKSPACE
+        // ==========================================
+
+        else if (key == '*')
+        {
+            if (tokenIndex > 0)
+            {
+                tokenIndex--;
+
+                tokenBuffer[tokenIndex] = '\0';
+
+                DisplayToken(tokenBuffer, tokenIndex);
+            }
+        }
+
+
+        // ==========================================
+        // # = ENTER
+        // ==========================================
+
+        else if (key == '#')
+        {
+            // --------------------------------------
+            // Must contain exactly 20 digits
+            // --------------------------------------
+
+            if (tokenIndex == 20)
+            {
+                uint64_t value;
+
+                // ----------------------------------
+                // Check for uint64_t overflow
+                // ----------------------------------
+
+                if (StringToUint64(tokenBuffer, &value))
+                {
+                    // Valid uint64_t
+                    return value;
+                }
+
+                // ----------------------------------
+                // Number is greater than:
+                //
+                // 18446744073709551615
+                // ----------------------------------
+
+                lcd.clear();
+
+                lcd.setCursor(0, 0);
+                lcd.print("Token Too Large");
+
+                lcd.setCursor(0, 1);
+                lcd.print("Enter Again");
+
+                delay(1500);
+
+                tokenIndex = 0;
+                tokenBuffer[0] = '\0';
+
+                lcd.clear();
+            }
+        }
+    }
+}
+
+
+// ==================================================
+// PRINT uint64_t TO SERIAL MONITOR
+// ==================================================
+
+void SerialPrintUint64(uint64_t value)
+{
+    char buffer[21];
+
+    uint8_t i = 20;
+
+    buffer[i] = '\0';
+
+    if (value == 0)
+    {
+        Serial.print('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[--i] = '0' + (value % 10);
+
+        value = value / 10;
+    }
+
+    Serial.print(&buffer[i]);
+}
+
+
+// ==================================================
+// SETUP
+// ==================================================
+
+void setup(void)
+{
+    // LCD
+    lcd.begin(16, 2);
+
+    // Serial
+    Serial.begin(9600);
+
+    Serial.println("Enter 20 digit token");
+}
+
+
+// ==================================================
+// LOOP
+// ==================================================
+
+void loop(void)
+{
+    uint64_t token;
+
+    token = GetToken();
+
+    // ----------------------------------------------
+    // Token has been successfully entered
+    // and converted to uint64_t.
+    // ----------------------------------------------
+
+    Serial.print("Token received: ");
+
+    SerialPrintUint64(token);
+
+    Serial.println();
+
+    //delay(1000);
+
+    // ----------------------------------------------
+    // Authentication
+    // ----------------------------------------------
+
+    /*
+    if (AuthenticateToken(token))
+    {
+        // Valid token
+    }
+    */
+}

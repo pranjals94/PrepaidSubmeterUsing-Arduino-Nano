@@ -1,0 +1,1194 @@
+
+
+#define F_CPU 16000000UL
+#include <Arduino.h>
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <util/atomic.h>
+
+#include <Crypto.h>
+#include <AES.h>
+#include <AES_CMAC.h>
+// Same secret key used by the token generator
+const uint8_t key[16] = {
+    0x2b, 0x7e, 0x15, 0x16,
+    0x28, 0xae, 0xd2, 0xa6,
+    0xab, 0xf7, 0x15, 0x88,
+    0x09, 0xcf, 0x4f, 0x3c
+};
+
+#include <LiquidCrystal.h>
+#include <Keypad.h>
+#include "eeprom_storage.h"
+
+#define ImpPerKwh 3200UL
+#define beep_pin 11
+#define backlight_pin 8
+#define servoPowerPin 9
+
+//alarm data byte of eeprom MSB 00001000 LSB
+#define ALARM_EXHAUSTED_BIT 0
+#define ALARM_LOW_BIT       1
+#define ALARM_LOW_ACK_BIT   2
+#define MCB_ON_BIT          3 // this bit should be high ie 1
+
+//record.imp_kWh must be read from eeprom when on actual deployment
+//volatile uint32_t record.imp_kWh = 5UL; // value Range 0 ? 4,294,967,295;
+volatile EEPROM_Record record={0};// initially all zero
+volatile uint8_t slot;
+volatile bool powerDown = true, pulseFlag = false;
+unsigned long previousMillis_keypadTimeout = 0;
+unsigned long previousMillis_PowerDown = 0;
+unsigned long previousMillis_Alarm = 0;
+unsigned long previousMillis_lcdIdeal = 0;
+volatile unsigned long pulseTimerStart = 0;
+const uint8_t meterId = 15;
+uint8_t maxRetry = 0;
+bool pulseTimerRunning = false ,servo_Mcb_Error = false, mcbOn = true, alarm_units_low = false, alarm_units_exhausted = false, alarm_units_low_ack = false;
+
+// RS, EN, D4, D5, D6, D7
+// pin no 0 is RX and 1 is tx, so cant' use usb programing
+LiquidCrystal lcd(0,1,4,5,6,7);
+
+byte powerIcon[] = {
+  0b00100,
+  0b00100,
+  0b10101,
+  0b10001,
+  0b10001,
+  0b11011,
+  0b01110,
+  0b00000
+};
+
+//-------------------------------------
+void EEPROM_Prepare_Status()
+{
+    record.status = 0;
+
+    if (alarm_units_exhausted)
+        record.status |= (1 << ALARM_EXHAUSTED_BIT);
+
+    if (alarm_units_low)
+        record.status |= (1 << ALARM_LOW_BIT);
+
+    if (alarm_units_low_ack)
+        record.status |= (1 << ALARM_LOW_ACK_BIT);
+
+    if (mcbOn)
+        record.status |= (1 << MCB_ON_BIT);
+
+}
+//----------------------------------------------------------
+
+void KeyBeep()
+{
+    digitalWrite(beep_pin, HIGH);
+    delay(8);
+    digitalWrite(beep_pin, LOW);
+}
+//------------------------------------------------
+void ServoTimer_Init()
+{
+    // D10 / OC1B
+    DDRB |= (1 << PB2); // D10 pin
+
+    // Fast PWM Mode 14
+    // TOP = ICR1
+    TCCR1A = (1 << COM1B1) |
+             (1 << WGM11);
+
+    TCCR1B = (1 << WGM13) |
+             (1 << WGM12);
+
+    // 50 Hz at 16 MHz, prescaler 8
+    ICR1 = 39999;
+
+    // Initially stopped
+    PORTB |= (1 << PB2);
+}
+
+void mcbDown()
+{
+   //save to eeprom and disable interrupts, as the INT0 interrupt triggers on running the servo as it causes voltage flacitions.
+   // turn off all periferials during eeprome Write
+    digitalWrite(backlight_pin, LOW); // lcdBacklight turn off
+    ServoTimer_Stop(); // stop the servo
+    digitalWrite(servoPowerPin, LOW); // Servo power OFF
+
+    // Disable INT0 so servo-related voltage fluctuations
+    // cannot trigger the power-fail ISR
+    cli();
+    EIMSK &= ~(1 << INT0); // int0 disabled
+    // Clear any pending INT0 flag
+    EIFR |= (1 << INTF0);
+    sei();
+  
+    // this eeprom save is for security in case the power surge failure during servo operation
+    EEPROM_Save_Record((EEPROM_Record *)&record, slot);
+
+    // Servo power ON
+    digitalWrite(servoPowerPin, HIGH);
+    ServoTimer_Init();
+
+    record.sequence++;
+    slot++;
+
+    delay(10);
+
+    // Initial position
+    OCR1B = 1000;
+
+    // Reconnect OC1B to Timer1
+    TCCR1A |= (1 << COM1B1);
+
+    // Start Timer1, prescaler = 8
+    TCCR1B |= (1 << CS11);
+
+    delay(1000);
+
+    // Final position
+    OCR1B = 3300;
+
+    delay(1000);
+
+    // Return to initial position
+    OCR1B = 1000;
+
+    delay(1000);
+    ServoTimer_Stop(); // stop the servo
+    // Servo power OFF
+    digitalWrite(servoPowerPin, LOW);
+
+    digitalWrite(backlight_pin, HIGH); // lcdBacklight turn ON
+// re enable interrupts
+    cli();
+    EIMSK |= (1 << INT0); // int0 enable
+    EIFR |= (1 << INTF0); // Clear any pending INT0 flag
+    sei();
+}
+
+void ServoTimer_Stop(){
+      // Stop Timer1
+    TCCR1B &= ~((1 << CS12) |
+                (1 << CS11) |
+                (1 << CS10));
+
+    // Disconnect OC1B
+    TCCR1A &= ~(1 << COM1B1);
+
+    // Keep servo signal HIGH
+    PORTB |= (1 << PB2);
+
+    // Servo power OFF
+    digitalWrite(servoPowerPin, LOW);
+}
+
+//---------------- 12-key keypad------------------
+const byte ROWS = 4;
+const byte COLS = 3;
+
+char keys[ROWS][COLS] =
+{
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'*', '0', '#'}
+};
+
+// Rows: D8, D9, D10, D11
+byte rowPins[ROWS] = {A5, A4, A3, A2};
+
+// Columns: D12, A2, A3
+byte colPins[COLS] = {A1, A0, 12};
+
+Keypad keypad = Keypad(makeKeymap(keys),
+                       rowPins,
+                       colPins,
+                       ROWS,
+                       COLS);
+                       
+// ==================================================
+// DISPLAY TOKEN
+// ==================================================
+
+void DisplayToken(const char *tokenBuffer, uint8_t tokenIndex)
+{
+    lcd.clear();
+
+    // -------------------------------
+    // First line
+    // -------------------------------
+
+    lcd.setCursor(0, 0);
+    lcd.print("Token: ");
+
+    // First group: 0000
+    for (uint8_t i = 0; i < 4; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 4)
+        lcd.print('-');
+
+    // Second group: 0000
+    for (uint8_t i = 4; i < 8; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    // -------------------------------
+    // Second line
+    // -------------------------------
+
+    lcd.setCursor(0, 1);
+
+    if (tokenIndex >= 8)
+        lcd.print('-');
+
+    // Third group
+    for (uint8_t i = 8; i < 12; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 12)
+        lcd.print('-');
+
+    // Fourth group
+    for (uint8_t i = 12; i < 16; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+
+    if (tokenIndex >= 16)
+        lcd.print('-');
+
+    // Fifth group
+    for (uint8_t i = 16; i < 20; i++)
+    {
+        if (i < tokenIndex)
+            lcd.print(tokenBuffer[i]);
+    }
+}
+
+//---------- View Token Serial No. --------------
+void showInfo()
+{
+    const char password[] = "1937504268159357";
+    char entered[17] = {0};
+    uint8_t index = 0;
+
+    digitalWrite(backlight_pin, HIGH);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(" Enter Password:");
+    lcd.setCursor(0, 1);
+
+    previousMillis_keypadTimeout = millis();
+
+    while (1)
+    {
+        // 30 second keypad timeout
+        if (delay_millisecs(30000, &previousMillis_keypadTimeout))
+        {
+            lcd.clear();
+            return;
+        }
+
+        char key = keypad.getKey();
+
+        if (key != NO_KEY)
+        {
+            KeyBeep();
+            previousMillis_keypadTimeout = millis();
+        }
+
+        // -------------------------------
+        // Numeric key
+        // -------------------------------
+        if (key >= '0' && key <= '9')
+        {
+            if (index < 16)
+            {
+                entered[index++] = key;
+                entered[index] = '\0';
+
+                lcd.setCursor(index - 1, 1);
+                lcd.print('*');
+            }
+        }
+
+        // -------------------------------
+        // Backspace
+        // -------------------------------
+        else if (key == '*')
+        {
+            if (index > 0)
+            {
+                index--;
+                entered[index] = '\0';
+
+                lcd.setCursor(index, 1);
+                lcd.print(' ');
+                lcd.setCursor(index, 1);
+            }
+        }
+
+        // -------------------------------
+        // Enter
+        // -------------------------------
+        else if (key == '#')
+        {
+            if (strcmp(entered, password) == 0)
+            {
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Meter Id: ");
+                lcd.print(meterId);
+                // ---------------------------
+                // Load Token Serial
+                // ---------------------------
+                lcd.setCursor(0, 1);
+                lcd.print("Sl No. ");
+                lcd.print(record.token_serial);
+             
+
+                delay(3000);
+                lcd.clear();
+                return;
+            }
+            else
+            {
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Wrong Password !");
+
+                delay(2000);
+
+                lcd.clear();
+                return;
+            }
+        }
+    }
+}
+
+//----------servoTest--------------
+void ServoMcbTest()
+{
+    const char password[] = "1937504268159357";
+    char entered[17] = {0};
+    uint8_t index = 0;
+
+    digitalWrite(backlight_pin, HIGH); // lcdBacklight
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ServoTest. pin:");
+    lcd.setCursor(0, 1);
+    previousMillis_keypadTimeout = millis(); // get the latest millisec
+
+    while (1)
+    {
+      if (delay_millisecs(30000, &previousMillis_keypadTimeout)){ // 30 sec timeout
+            lcd.clear();
+            return;
+          }
+
+        char key = keypad.getKey();
+        
+        // keypad ideal timeOut
+        if (key != NO_KEY)
+          {
+              KeyBeep();
+              previousMillis_keypadTimeout = millis(); // get the latest millisec
+          }
+
+        if (key >= '0' && key <= '9')
+        {
+            if (index < 16)
+            {
+                entered[index++] = key;
+                entered[index] = '\0';
+
+                lcd.setCursor(index - 1, 1);
+                lcd.print('*');
+            }
+        }
+
+        else if (key == '*')
+        {
+            if (index > 0)
+            {
+                index--;
+                entered[index] = '\0';
+
+                lcd.setCursor(index, 1);
+                lcd.print(' ');
+                lcd.setCursor(index, 1);
+            }
+        }
+
+        else if (key == '#')
+        {
+            if (strcmp(entered, password) == 0)
+            {
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Password Correct");
+                lcd.setCursor(0, 1);
+                lcd.print("Mcb Testing...");
+
+                delay(500);
+
+                mcbDown();
+                lcd.clear();
+                return;
+            }
+            else
+            {
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Wrong Password !");
+                delay(2000);
+                lcd.clear();
+
+                return;
+            }
+        }
+    }
+}
+
+// ==================================================
+// CHECK AND CONVERT 20 DIGIT STRING TO uint64_t
+// ==================================================
+//
+// Returns:
+// 1 = success
+// 0 = overflow / invalid
+//
+// The result is returned through *result.
+//
+// ==================================================
+
+bool StringToUint64(const char *str, uint64_t *result)
+{
+    uint64_t value = 0;
+    /* max decimal token value
+      Meter ID : 15
+      Serial   : 65500
+      Recharge : 1023
+      Token    : 18436892373916031911
+    */
+    const uint64_t MAX_TOKEN = 18436892373916031911ULL; 
+
+    while (*str)
+    {
+        // Only accept digits
+        if (*str < '0' || *str > '9')
+            return false;
+
+        uint8_t digit = *str - '0';
+
+        // Check overflow against your maximum token
+        if (value > (MAX_TOKEN - digit) / 10ULL)
+            return false;
+
+        value = value * 10ULL + digit;
+
+        str++;
+    }
+
+    *result = value;
+
+    return true;
+}
+
+
+// ==================================================
+// GET TOKEN FROM KEYPAD
+// ==================================================
+
+uint64_t GetToken(void)
+{
+    previousMillis_keypadTimeout = millis();
+    char tokenBuffer[21];
+
+    uint8_t tokenIndex = 0;
+
+    tokenBuffer[0] = '\0';
+
+    digitalWrite(backlight_pin, HIGH); // lcdBacklight
+    lcd.setCursor(0, 0);
+    lcd.print("Token: ");
+
+    while (1)
+    {
+       // keypad ideal timeOut
+          if (delay_millisecs(50000, &previousMillis_keypadTimeout)){ // 50 sec timeout
+            lcd.clear();
+            maxRetry--; // increnment max retry once to compensate retries left on time out.
+            return;
+          }
+
+        char key = keypad.getKey();
+
+        if (key != NO_KEY)
+          {
+              KeyBeep();
+          }
+        if (key == NO_KEY)
+            continue;
+        
+        previousMillis_keypadTimeout = millis();
+        // ==========================================
+        // NUMBER KEY
+        // ==========================================
+
+        if (key >= '0' && key <= '9')
+        {
+          
+          if (tokenIndex < 20)
+          {
+                tokenBuffer[tokenIndex] = key;
+
+                tokenIndex++;
+
+                tokenBuffer[tokenIndex] = '\0';
+
+                DisplayToken(tokenBuffer, tokenIndex);
+            }
+        }
+
+        // ==========================================
+        // * = BACKSPACE
+        // ==========================================
+
+        else if (key == '*')
+        {
+            if (tokenIndex > 0)
+            {
+                tokenIndex--;
+
+                tokenBuffer[tokenIndex] = '\0';
+
+                DisplayToken(tokenBuffer, tokenIndex);
+            }
+        }
+
+
+        // ==========================================
+        // # = ENTER
+        // ==========================================
+
+        else if (key == '#')
+        {
+            // --------------------------------------
+            // Must contain exactly 20 digits
+            // --------------------------------------
+
+            if (tokenIndex == 20)
+            {
+                uint64_t value;
+
+                // ----------------------------------
+                // Check for uint64_t overflow
+                // ----------------------------------
+
+                if (StringToUint64(tokenBuffer, &value))
+                {
+                    return value;
+                }
+
+                lcd.clear();
+                lcd.setCursor(2, 0);
+                lcd.print("Out Of Range.");
+
+                lcd.setCursor(0, 1);
+                lcd.print("Check Token No ?");
+
+                delay(2000);
+
+               lcd.clear();
+               return 0;
+            }
+        }
+    }
+}
+
+// ============================================================
+// CREATE AUTHENTICATED MESSAGE
+//
+// 32-bit message:
+//
+// bits 31-28 : Meter ID       4 bits
+// bits 27-12 : Serial        16 bits
+// bits 11-2  : Recharge      10 bits
+// bits 1-0   : 00
+// ============================================================
+
+uint32_t makeMessage(uint8_t meterID,
+                     uint16_t serial,
+                     uint16_t recharge)
+{
+    uint32_t message = 0;
+
+    // Meter ID
+
+    message |=
+        ((uint32_t)(meterID & 0x0F) << 28);
+
+    // Serial
+
+    message |=
+        ((uint32_t)serial << 12);
+
+    // Recharge
+
+    message |=
+        ((uint32_t)(recharge & 0x03FF) << 2);
+
+    // Bits 1-0 remain 00
+
+    return message;
+}
+// ============================================================
+// EXTRACT CMAC FROM TOKEN
+// ============================================================
+
+uint64_t getTokenCMAC(uint64_t token)
+{
+    // Lower 38 bits
+
+    uint64_t mask =
+        0x3FFFFFFFFFULL;
+
+    return token & mask;
+}
+// ============================================================
+// CALCULATE 38-BIT CMAC
+// ============================================================
+
+uint64_t calculateCMAC38(uint32_t message)
+{
+    uint8_t mac[16];
+
+    AESTiny128 aes128;
+    AES_CMAC cmac(aes128);
+
+    // Convert 32-bit message to big endian
+
+    uint8_t data_raw[4] = {
+        (uint8_t)(message >> 24),
+        (uint8_t)(message >> 16),
+        (uint8_t)(message >> 8),
+        (uint8_t)message
+    };
+
+    // Generate AES-CMAC
+
+    cmac.generateMAC(
+        mac,
+        key,
+        data_raw,
+        sizeof(data_raw)
+    );
+
+    // --------------------------------------------------------
+    // Extract first 38 bits
+    //
+    // mac[0] = 8 bits
+    // mac[1] = 8 bits
+    // mac[2] = 8 bits
+    // mac[3] = 8 bits
+    // mac[4] upper 6 bits
+    //
+    // Total = 38 bits
+    // --------------------------------------------------------
+
+    uint64_t mac38 = 0;
+
+    mac38 |= ((uint64_t)mac[0] << 30);
+    mac38 |= ((uint64_t)mac[1] << 22);
+    mac38 |= ((uint64_t)mac[2] << 14);
+    mac38 |= ((uint64_t)mac[3] << 6);
+    mac38 |= ((uint64_t)(mac[4] >> 2));
+
+    return mac38;
+}
+
+//----------------Authentuication------------------------------------------------
+void authenticate(uint64_t token)
+{
+    // Token received from keypad
+
+    // --------------------------------------------------------
+    // Extract payload
+    // --------------------------------------------------------
+
+    uint32_t payload =
+        (uint32_t)(token >> 38); // take out the 38 bits cmac
+
+    // --------------------------------------------------------
+    // Extract serial
+    // --------------------------------------------------------
+
+    uint16_t extractedSerial =
+        (uint16_t)(payload >> 10);
+
+    // --------------------------------------------------------
+    // Extract recharge
+    // --------------------------------------------------------
+
+    uint16_t extractedRecharge =
+        payload & 0x03FF;
+
+    // --------------------------------------------------------
+    // Extract received CMAC
+    // --------------------------------------------------------
+
+    uint64_t receivedCMAC =
+        getTokenCMAC(token);
+
+    // --------------------------------------------------------
+    // Reconstruct original authenticated message
+    //
+    // IMPORTANT:
+    //
+    // Meter ID comes from THIS meter.
+    //
+    // It is not taken from the token.
+    // --------------------------------------------------------
+
+    uint32_t message =
+        makeMessage(
+            meterId,
+            extractedSerial,
+            extractedRecharge
+        );
+
+    // --------------------------------------------------------
+    // Calculate CMAC 38 bits
+    // --------------------------------------------------------
+
+    uint64_t calculatedCMAC =
+        calculateCMAC38(message);
+
+    // Authenticate                                                                
+
+if ((receivedCMAC == calculatedCMAC) && (extractedSerial > record.token_serial) ) // meter_id is varified by the CMAC itself
+    {
+      maxRetry = 0;
+      uint32_t rechargeImpulses;
+      rechargeImpulses = (uint32_t)extractedRecharge * ImpPerKwh;
+
+        if (rechargeImpulses <= (UINT32_MAX - record.imp_kWh))
+        {
+          ATOMIC_BLOCK(ATOMIC_RESTORESTATE) // this block disables the all the interrupts, keep as short as possible
+          {
+              record.imp_kWh += rechargeImpulses;
+          }
+
+          // turn off all periferials during eeprome Write
+          digitalWrite(backlight_pin, LOW); // lcdBacklight turn off
+          ServoTimer_Stop(); // stop the servo
+
+          //Recharge successful
+          mcbOn = true;
+          servo_Mcb_Error = false;// clear in case its set
+          pulseTimerRunning = false;
+          pulseTimerStart = 0;
+
+          // Stop any active alarm output immediately
+          PORTB &= ~(1 << PB3);   // Beep OFF
+          PORTB |=  (1 << PB0);   // Backlight ON
+
+          alarm_units_exhausted = false;
+          alarm_units_low = false;
+
+          record.token_serial = extractedSerial; // update the serial
+          EEPROM_Prepare_Status();
+          EEPROM_Save_Record((EEPROM_Record *)&record, slot);
+
+          record.sequence++;
+          slot++;
+          if (slot >= NUM_RECORDS)
+            slot = 0;
+
+          digitalWrite(backlight_pin, HIGH); // lcdBacklight turn on
+          ServoTimer_Init(); // re enable the servo
+        
+
+          lcd.clear();
+          lcd.setCursor(5, 0);
+          lcd.print("Recharge");
+          lcd.setCursor(5, 1);
+          lcd.print("Successful.");
+        }
+        else
+        {;
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Cannot Recharge");
+          lcd.setCursor(0, 1);
+          lcd.print("to Excess Units!");
+        }
+    }
+    else
+    {
+      maxRetry++;
+      lcd.clear();
+      if (maxRetry >= 5)
+    {
+        lcd.setCursor(1, 0);
+        lcd.print("METER LOCKED !");
+
+        while (1)
+        {
+            // Permanently locked until power cycle
+              float energy = (float)record.imp_kWh / ImpPerKwh;
+              lcd.setCursor(1, 1);
+              lcd.print(energy, 2);
+              lcd.print(" kWh    ");
+        }
+    }
+    else
+    {
+        lcd.setCursor(0, 0);
+        lcd.print(" Token Invalid !");
+        lcd.setCursor(0, 1);
+        lcd.print("Attempts left: ");
+        lcd.print(5 - maxRetry);
+        delay(1000);
+    }
+    }
+    delay(2000);
+}
+
+//----------------------------------------------------------------------------
+void ext_interrup_init(){
+    // INT0 = D2, INT1 = D3
+    pinMode(2, INPUT_PULLUP);
+    pinMode(3, INPUT_PULLUP);
+
+    // ------------------------------------------------
+    // INT0 and INT1: Falling edge
+    // ------------------------------------------------
+
+    // ISC01:1 ISC00:0 → INT0 falling edge
+    // ISC11:1 ISC10:0 → INT1 falling edge
+
+    EICRA |= (1 << ISC01);
+    EICRA &= ~(1 << ISC00);
+
+    EICRA |= (1 << ISC11);
+    EICRA &= ~(1 << ISC10);
+
+    // Enable INT0 and INT1
+    EIMSK |= (1 << INT0);
+    EIMSK |= (1 << INT1);
+
+    sei();
+}
+
+ISR(INT0_vect){ // power down detection
+  if(!powerDown){ // executes only if powerdown is false to prevent debounce triggers
+    digitalWrite(backlight_pin, LOW); // lcdBacklight
+    ServoTimer_Stop();
+    digitalWrite(servoPowerPin, LOW); // Turn off servo
+
+    EEPROM_Save_Record((EEPROM_Record *)&record, slot);
+
+    // In case of power down detect but mcu may not reset as power arrived immediately
+    // prepare the next slot and sequence.
+    record.sequence++;
+    slot++;
+    if (slot >= NUM_RECORDS)//slot loops to 0 after 77
+      slot = 0;
+    
+    PORTB |= (1 << PB5);
+    powerDown = true;
+  }
+  }
+
+ISR(INT1_vect)
+{
+  // Meter pulse
+  if(record.imp_kWh > 0)
+    {record.imp_kWh--;}
+    else
+    {
+      pulseFlag = true;
+    }
+}
+//---------------------------------------------------------
+bool delay_millisecs(unsigned long interval, unsigned long *previousMillis)
+{
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - *previousMillis >= interval)
+    {
+        *previousMillis = currentMillis;
+        return true;
+    }
+
+    return false;
+}
+
+//-----------ResstoreAlarmStatus on power cycle-----------------------------------------------
+void EEPROM_Restore_Status()
+{
+    alarm_units_exhausted = record.status & (1 << ALARM_EXHAUSTED_BIT);
+    alarm_units_low       = record.status & (1 << ALARM_LOW_BIT);
+    alarm_units_low_ack   = record.status & (1 << ALARM_LOW_ACK_BIT);
+    mcbOn                 = record.status & (1 << MCB_ON_BIT);
+}
+//-------------------------------------------------------
+
+void setup()
+{
+  pinMode(backlight_pin, OUTPUT);
+  pinMode(beep_pin, OUTPUT);
+
+  DDRB |= (1 << PB5); // in built led
+
+    ext_interrup_init();
+    lcd.begin(16, 2);
+    lcd.createChar(0, powerIcon); // create the icon and store in lcd cgram 0
+    //---------------------------------------------------------
+  slot = EEPROM_get_slot_number(); // get the newest slot number
+	if(EEPROM_Read_Record(slot, &record)){// if crc valid
+		slot++;
+		if(slot >=NUM_RECORDS){slot=0;}
+
+    EEPROM_Restore_Status();
+
+		record.sequence = record.sequence;
+		record.sequence++;
+		if(record.sequence>=4294967290)// max value of uint32_t 4294967295
+		{
+      // if power cut happens 30 times a day total in a year, it will reach its
+      //max value in 392,000 years.
+			//discard the meter
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(" Re Initialize  ");
+      lcd.setCursor(0, 1);
+      lcd.print("EEprom to Reuse.");
+		}
+	}else{
+    lcd.setCursor(0, 0);
+    lcd.print("   EEPROM READ  ");
+    lcd.setCursor(0, 1);
+    lcd.print("ERROR. Restart !");
+    while(1){
+      digitalWrite(beep_pin, HIGH);
+      delay(50); 
+      digitalWrite(beep_pin, LOW);
+      delay(500); 
+    }
+  }
+
+
+  digitalWrite(beep_pin, HIGH); // beep
+  delay(50);
+  digitalWrite(beep_pin, LOW);
+
+  ServoTimer_Init();
+  pinMode(servoPowerPin, OUTPUT); // base of Bd139, Servo groung connected
+  digitalWrite(servoPowerPin, LOW);
+}
+//---------------------------------------------------
+
+void loop()
+{ 
+  if (powerDown) // prevent multiple trigger of the ISR0 by providing delay
+    {
+        if (delay_millisecs(300, &previousMillis_PowerDown))
+        {
+          powerDown = false;
+          ServoTimer_Init();
+        }
+      return; //The return is important if you want the rest of the normal loop to stop operating during the
+    }
+
+//---------------------------------
+//---- Verify MCB cut-out based on pulse timing ----
+// 9 W LED load: approximately 110 seconds between pulses
+
+// ------------------------------------------
+// MCB PULSE VERIFICATION
+// ------------------------------------------
+
+if (pulseFlag)
+{
+    pulseFlag = false;
+
+    if (!pulseTimerRunning)
+    {
+        // ------------------------------------------
+        // FIRST VERIFICATION PULSE
+        // ------------------------------------------
+
+        pulseTimerStart = millis();
+        pulseTimerRunning = true;
+    }
+    else
+    {
+        // ------------------------------------------
+        // SECOND VERIFICATION PULSE
+        // ------------------------------------------
+
+        unsigned long elapsed = millis() - pulseTimerStart;
+
+       //pulseTimerRunning = false;
+
+        if (elapsed < 100000UL)
+        {
+            // Second pulse came BEFORE 100 seconds
+            // MCB FAILED
+
+            servo_Mcb_Error = true;
+            pulseTimerStart = millis();
+        }
+        else
+        {
+            // Second pulse came AFTER 10 seconds
+            // MCB OK
+
+            servo_Mcb_Error = false;
+            pulseTimerRunning = false;
+
+            PORTB &= ~(1 << PB3);
+        }
+    }
+}
+
+
+// ------------------------------------------
+// NO SECOND PULSE FOR 10 SECONDS
+// ------------------------------------------
+
+if (pulseTimerRunning &&
+    (millis() - pulseTimerStart >= 100000UL))// 100 secs
+{
+    // No second pulse
+    // MCB successfully tripped
+
+    pulseTimerRunning = false;
+
+    servo_Mcb_Error = false;
+
+    PORTB &= ~(1 << PB3);
+}
+
+if(servo_Mcb_Error){
+  lcd.setCursor(15, 0);
+  lcd.write(byte(0));
+}
+//--------------------------------------------------------------
+
+  if (delay_millisecs(1000, &previousMillis_Alarm)) // non blocking delay
+      {
+          if(servo_Mcb_Error||alarm_units_low||alarm_units_exhausted){ // raise alarm
+            PORTB ^= (1 << PB3); // toggle pin 11 ie beep pin
+            PORTB ^= (1 << PB0); // toggle lcd back light
+          }
+      }
+
+   if (delay_millisecs(4000, &previousMillis_lcdIdeal)) // non blocking delay
+      { //ideally keep lcd back light in toggling to save power
+            PORTB ^= (1 << PB0); // toggle lcd back light
+      }
+
+  if(record.imp_kWh<1 && mcbOn){ // turn off the MCB, needs to turn on manually
+    mcbOn = false; // set the mcbOn = true in recharge successful
+    alarm_units_exhausted = true;
+    EEPROM_Prepare_Status();
+    mcbDown();
+  }
+
+  if((record.imp_kWh < (ImpPerKwh*10UL)) && !alarm_units_low && !alarm_units_low_ack){
+    alarm_units_low= true;
+    EEPROM_Prepare_Status();
+  }
+
+  PORTB &= ~(1 << PB5); // on board Led turn off if turned on in ISR0
+//---------------------------------------------------
+  lcd.setCursor(0, 0);
+  float energy = (float)record.imp_kWh / ImpPerKwh;
+  lcd.print(energy, 1);
+  lcd.print(" kWh ");
+
+  //test slot decimal loop
+    // lcd.print(slot);
+    // lcd.print(" ");
+  //----------------------------------------------------
+
+  if(record.imp_kWh<1){
+    lcd.setCursor(8, 0);
+    lcd.print(record.imp_kWh);
+    lcd.print("Imp ");
+    lcd.setCursor(0, 1);
+    lcd.print("Units Exhausted.");
+  }
+  else if(record.imp_kWh < (ImpPerKwh*10UL)){
+    lcd.setCursor(8, 0);
+    lcd.print(record.imp_kWh);
+    lcd.print("Imp ");
+    lcd.setCursor(0, 1);
+    lcd.print("Low Bal Recharge");
+  }else{
+    // Balance has recovered above the low-balance limit
+    if (alarm_units_low_ack)
+    {
+      alarm_units_low_ack = false;
+      EEPROM_Prepare_Status();
+    }
+    lcd.setCursor(1, 1);
+    lcd.print(record.imp_kWh);
+    lcd.print(" Imp");
+  }
+
+  char key = keypad.getKey();
+
+  if (key != NO_KEY)
+    {
+        KeyBeep();
+    }
+
+  if (key != NO_KEY && (alarm_units_exhausted||alarm_units_low)) // ack alarm with any key press
+    {
+        alarm_units_exhausted = false;//write this ack to eeprom
+        alarm_units_low = false; //write this ack to eeprom
+        alarm_units_low_ack = true; //write this ack to eeprom
+        EEPROM_Prepare_Status();
+        PORTB &= ~(1 << PB3);   //Beep OFF
+        PORTB |=  (1 << PB0);   //Backlight ON
+        return;
+    }
+  
+  if (key == NO_KEY)
+    return;
+  
+      
+  if (key >= '0' && key <= '9')
+    {
+      lcd.clear();
+      uint64_t token;
+      token = GetToken();
+      authenticate(token);
+      lcd.clear();
+    }else if(key == '*')
+    {
+      showInfo();
+    }else{
+      ServoMcbTest();
+    }
+}

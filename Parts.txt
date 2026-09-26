@@ -1,0 +1,15 @@
+1) optocopuler
+2) l header pins
+3) 12 button keypad
+4) capacitors if needed
+5) servos if needed
+6) 5 volt buzzer(active/passive)
+7) low  voltage drop diodes
+8) logic level mosfet
+9) arduino nano
+10) 10 k pot
+
+Further improvement in the code halted because the arduino nano 
+got damaged due to power down during flashing operation.
+
+Note:- provide battery power at least during flashing the mcu
